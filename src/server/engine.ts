@@ -58,6 +58,18 @@ export type ConflictBody = {
 export type ErrorBody = {error: string; detail?: string};
 export type AppendOutcome = {status: number; body: PatchResultBody | ConflictBody | ErrorBody};
 
+/**
+ * Download view of a session. Only `ready` (completed, blob length agrees
+ * with the committed offset) is servable; the other kinds explain exactly
+ * which bytes — if any — were confirmed before the session stopped being
+ * downloadable.
+ */
+export type DownloadState =
+  | {kind: 'ready'; id: string; name: string; size: number; sha256: string; revision: number}
+  | {kind: 'active'; id: string; offset: number; revision: number; sha256: string}
+  | {kind: 'cancelled'; id: string; offset: number; revision: number; sha256: string}
+  | {kind: 'gone'};
+
 export type CreateSessionOptions = {
   id?: string;
   name?: string;
@@ -328,6 +340,75 @@ export class UploadEngine {
       throw new Error('digest drift: blob and metadata disagree');
     }
     return {offset: session.offset, sha256: session.sha256};
+  }
+
+  /**
+   * Describe the session as a downloadable object.
+   *
+   * A session is only servable when it is `completed` — the one state whose
+   * byte content can never change again. `active` sessions still mutate (the
+   * prefix is not the final file) and `cancelled` sessions must not be read
+   * back even though their bytes may still sit in storage. For a completed
+   * session the blob length is cross-checked against the committed offset so
+   * a torn blob can never be served under a healthy identity.
+   */
+  async describeDownload(id: string): Promise<DownloadState> {
+    const session = this.getSession(id);
+    if (!session) return {kind: 'gone'};
+    if (session.state === 'cancelled') {
+      return {
+        kind: 'cancelled',
+        id: session.id,
+        offset: session.offset,
+        revision: session.revision,
+        sha256: session.sha256,
+      };
+    }
+    if (session.state === 'active') {
+      return {
+        kind: 'active',
+        id: session.id,
+        offset: session.offset,
+        revision: session.revision,
+        sha256: session.sha256,
+      };
+    }
+    const size = await this.storage.length(session.id);
+    if (size !== session.offset) {
+      throw new Error(
+        `blob length ${size} disagrees with committed offset ${session.offset}`,
+      );
+    }
+    return {
+      kind: 'ready',
+      id: session.id,
+      name: session.name,
+      size,
+      sha256: session.sha256,
+      revision: session.revision,
+    };
+  }
+
+  /**
+   * Read [start, start+length) of a COMPLETED session, but only while the
+   * session's identity is still exactly `expectedSha256`. Returns undefined
+   * when the session vanished, stopped being completed (e.g. cancelled
+   * mid-read), or the identity differs — callers must treat that as "this
+   * content can no longer be vouched for" and fail the response rather than
+   * serve bytes of a different object.
+   */
+  async readCompletedRange(
+    id: string,
+    start: number,
+    length: number,
+    expectedSha256: string,
+  ): Promise<Buffer | undefined> {
+    const session = this.sessions.get(id);
+    if (!session || session.state !== 'completed' || this.isExpired(session)) {
+      return undefined;
+    }
+    if (session.sha256 !== expectedSha256) return undefined;
+    return this.storage.readChunk(id, start, length);
   }
 }
 

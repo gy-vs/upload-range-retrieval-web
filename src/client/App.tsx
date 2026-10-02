@@ -3,13 +3,17 @@ import {
   Ban,
   CheckCircle2,
   Clock3,
+  Download,
   FlaskConical,
   HardDriveDownload,
   Layers,
   OctagonX,
+  Pause,
   Play,
   RadioTower,
   RefreshCw,
+  Save,
+  SearchCheck,
   ShieldAlert,
   Zap,
 } from 'lucide-react';
@@ -22,6 +26,12 @@ import {
   type UploadBlock,
   type UploadEvent,
 } from './uploader';
+import {
+  fetchDownloadInfo,
+  runDownload,
+  type DownloadEvent,
+  type DownloadProgress,
+} from './downloader';
 
 type Scenario =
   | 'normal'
@@ -49,6 +59,43 @@ const DEFAULT_PAYLOAD =
 
 type LogLine = {id: number; text: string; tone: 'info' | 'ok' | 'warn' | 'bad'};
 
+type InspectState = {
+  id: string;
+  name: string;
+  state: string;
+  offset: number;
+  revision: number;
+  sha256: string;
+};
+
+/**
+ * Download panel state. `confirmed` counts ONLY bytes this browser has
+ * actually received and kept — it is never derived from server-side offsets,
+ * so a page refresh (which drops this in-memory state) cannot leave the UI
+ * claiming a finished download it no longer has.
+ */
+type DownloadUi = {
+  sessionId: string;
+  phase: 'idle' | 'info' | 'downloading' | 'paused' | 'done' | 'failed';
+  size: number;
+  sha256: string;
+  etag: string;
+  confirmed: number;
+  saved: DownloadProgress | null;
+  reason?: string;
+  finalSha?: string;
+};
+
+const emptyDownload = (sessionId: string): DownloadUi => ({
+  sessionId,
+  phase: 'idle',
+  size: 0,
+  sha256: '',
+  etag: '',
+  confirmed: 0,
+  saved: null,
+});
+
 export default function App() {
   const [scenario, setScenario] = useState<Scenario>('normal');
   const [payloadText, setPayloadText] = useState(DEFAULT_PAYLOAD);
@@ -63,7 +110,14 @@ export default function App() {
     expectedSha: string;
     consistent: boolean;
   }>(null);
+  const [sessionInput, setSessionInput] = useState('');
+  const [inspect, setInspect] = useState<InspectState | null>(null);
+  const [dl, setDl] = useState<DownloadUi>(emptyDownload(''));
   const abortRef = useRef<AbortController | null>(null);
+  /** Token of the download run that currently owns the panel. */
+  const dlTokenRef = useRef(0);
+  const dlAbortRef = useRef<AbortController | null>(null);
+  const dlBytesRef = useRef<Uint8Array | null>(null);
   const logId = useRef(0);
 
   function log(text: string, tone: LogLine['tone'] = 'info') {
@@ -111,10 +165,173 @@ export default function App() {
     }
   }
 
+  function renderDownloadEvent(event: DownloadEvent) {
+    switch (event.type) {
+      case 'info':
+        setDl((prev) => ({...prev, size: event.size, sha256: event.sha256, etag: event.etag}));
+        log(`⇓ HEAD 200 size=${event.size} etag=${event.etag.slice(1, 13)}… — object identity pinned`, 'info');
+        break;
+      case 'request':
+        log(`→ GET download Range bytes=${event.offset}- + If-Range (attempt ${event.attempt})`, 'info');
+        break;
+      case 'progress':
+        setDl((prev) => ({...prev, confirmed: event.confirmed, size: event.total}));
+        break;
+      case 'retry':
+        log(`↻ ${event.reason} — resuming at confirmed bytes in ${event.delayMs}ms`, 'warn');
+        break;
+      case 'paused':
+        log(`⏸ paused at ${event.confirmed}/${event.total}B — confirmed bytes kept locally`, 'warn');
+        break;
+      case 'verify':
+        log(`⇓ assembled sha=${event.sha256.slice(0, 12)}… vs pinned ${event.expected.slice(0, 12)}…`, 'info');
+        break;
+      case 'done':
+        log(`■ download complete & verified: ${event.size}B sha=${event.sha256.slice(0, 12)}…`, 'ok');
+        break;
+      case 'fatal':
+        log(`✗ download stopped: ${event.reason}`, 'bad');
+        break;
+      case 'log':
+        log(event.message, 'info');
+        break;
+    }
+  }
+
+  /** Invalidate any in-flight download run and drop its panel state. */
+  function resetDownload() {
+    dlTokenRef.current += 1;
+    dlAbortRef.current?.abort();
+    dlAbortRef.current = null;
+    dlBytesRef.current = null;
+  }
+
+  async function inspectSession(id: string) {
+    const trimmed = id.trim();
+    if (!trimmed) return;
+    resetDownload();
+    setInspect(null);
+    const res = await fetch(`/api/uploads/${trimmed}`).catch(() => null);
+    if (!res || res.status === 410) {
+      setDl({...emptyDownload(trimmed), phase: 'failed', reason: 'session_expired: unknown or aged out'});
+      log(`⇓ ${trimmed}: 410 session_expired — nothing downloadable`, 'bad');
+      return;
+    }
+    const body = (await res.json()) as InspectState;
+    setInspect(body);
+    if (body.state === 'completed') {
+      const info = await fetchDownloadInfo({sessionId: trimmed}).catch(() => null);
+      if (!info) {
+        setDl({...emptyDownload(trimmed), phase: 'failed', reason: 'download info unavailable'});
+        return;
+      }
+      if (info.kind === 'ready') {
+        setDl({
+          ...emptyDownload(trimmed),
+          phase: 'info',
+          size: info.size,
+          sha256: info.sha256,
+          etag: info.etag,
+        });
+        log(`⇓ ${trimmed} completed: size=${info.size}B sha=${info.sha256.slice(0, 12)}… — immutable, ready to download`, 'ok');
+      } else if (info.kind === 'cancelled') {
+        setDl({...emptyDownload(trimmed), phase: 'failed', reason: `session_cancelled: confirmed prefix ${info.offset}B is not downloadable`});
+      } else if (info.kind === 'active') {
+        setDl(emptyDownload(trimmed));
+      } else {
+        setDl({...emptyDownload(trimmed), phase: 'failed', reason: info.error});
+      }
+      return;
+    }
+    if (body.state === 'cancelled') {
+      setDl({
+        ...emptyDownload(trimmed),
+        phase: 'failed',
+        reason: `session_cancelled: confirmed prefix ${body.offset}B (sha ${body.sha256.slice(0, 12)}…) is not downloadable`,
+      });
+      log(`⇓ ${trimmed} cancelled — prefix ${body.offset}B was confirmed but is not downloadable`, 'bad');
+      return;
+    }
+    // active: bytes still changing — not a final file yet.
+    setDl(emptyDownload(trimmed));
+    log(`⇓ ${trimmed} active at offset=${body.offset} rev=${body.revision} — complete it to publish the final file`, 'info');
+  }
+
+  async function completeSession() {
+    if (!inspect) return;
+    const res = await fetch(`/api/uploads/${inspect.id}/complete`, {method: 'POST'}).catch(() => null);
+    if (!res || !res.ok) {
+      log(`⇓ complete failed for ${inspect.id}`, 'bad');
+      return;
+    }
+    log(`⇓ session ${inspect.id} completed — content is now immutable`, 'ok');
+    await inspectSession(inspect.id);
+  }
+
+  async function startDownload(id: string, resumeFrom?: DownloadProgress) {
+    // A new run takes over the panel: any stale run's late events/resolution
+    // are dropped via the token check, so a previous session's response can
+    // never be written into this session's result.
+    const token = ++dlTokenRef.current;
+    const abort = new AbortController();
+    dlAbortRef.current = abort;
+    setDl((prev) => ({...prev, phase: 'downloading', reason: undefined}));
+    const result = await runDownload({
+      sessionId: id,
+      resumeFrom,
+      signal: abort.signal,
+      onEvent: (event) => {
+        if (token !== dlTokenRef.current) return; // stale run (session switched)
+        renderDownloadEvent(event);
+      },
+    });
+    if (token !== dlTokenRef.current) return; // a newer run owns the panel now
+    dlAbortRef.current = null;
+    if (result.status === 'done') {
+      dlBytesRef.current = result.bytes;
+      setDl((prev) => ({
+        ...prev,
+        phase: 'done',
+        confirmed: result.progress.confirmed,
+        finalSha: result.sha256,
+        saved: null,
+      }));
+    } else if (result.status === 'paused') {
+      setDl((prev) => ({...prev, phase: 'paused', saved: result.progress, confirmed: result.progress.confirmed}));
+    } else {
+      setDl((prev) => ({
+        ...prev,
+        phase: 'failed',
+        reason: result.reason,
+        saved: result.progress,
+        confirmed: result.progress?.confirmed ?? prev.confirmed,
+      }));
+    }
+  }
+
+  function pauseDownload() {
+    // Aborting the in-flight request makes runDownload settle as 'paused'
+    // with every confirmed byte retained for a later resume.
+    dlAbortRef.current?.abort();
+  }
+
+  function saveFile() {
+    const bytes = dlBytesRef.current;
+    if (!bytes) return;
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${inspect?.name ?? 'download'}.bin`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   async function start() {
     setRunning(true);
     setLogs([]);
     setResult(null);
+    resetDownload();
+    setInspect(null);
     const payload = new TextEncoder().encode(payloadText);
 
     // 1. create session (short TTL for the expiry demo)
@@ -127,6 +344,8 @@ export default function App() {
       }),
     });
     const session = await createRes.json();
+    setSessionInput(session.id);
+    setDl(emptyDownload(session.id));
     log(`session ${session.id} created rev=0 offset=0${scenario === 'expire' ? ' ttl=2500ms' : ''}`, 'info');
 
     // 2. plan blocks for the scenario
@@ -255,6 +474,9 @@ export default function App() {
     } finally {
       setRunning(false);
       abortRef.current = null;
+      // Reflect the session's post-run state in the download panel (active ->
+      // offer Complete; cancelled/expired -> show the terminal explanation).
+      void inspectSession(session.id);
     }
   }
 
@@ -262,12 +484,15 @@ export default function App() {
     abortRef.current?.abort();
   }
 
+  const dlPercent =
+    dl.size > 0 ? Math.min(100, Math.round((dl.confirmed / dl.size) * 100)) : dl.phase === 'done' ? 100 : 0;
+
   return (
     <main className="shell">
       <header className="topbar">
         <FlaskConical size={20} />
         <strong>Resumable Upload Workbench</strong>
-        <small>offset CAS · session revision · per-block request ids</small>
+        <small>offset CAS · session revision · per-block request ids · verified download</small>
       </header>
 
       <section className="workbench">
@@ -365,6 +590,114 @@ export default function App() {
               </div>
             </div>
           )}
+
+          <div className="download">
+            <h3>Completed file download</h3>
+            <div className="download-load">
+              <input
+                aria-label="Session id"
+                value={sessionInput}
+                onChange={(e) => setSessionInput(e.target.value)}
+                placeholder="session id"
+                spellCheck={false}
+              />
+              <button onClick={() => void inspectSession(sessionInput)}>
+                <SearchCheck size={14} /> Inspect
+              </button>
+            </div>
+
+            {inspect && (
+              <div className="download-meta">
+                <span>
+                  <code>{inspect.id}</code> · {inspect.name}
+                </span>
+                <span>
+                  state <strong>{inspect.state}</strong> · offset {inspect.offset} · rev {inspect.revision}
+                </span>
+              </div>
+            )}
+
+            {inspect?.state === 'active' && (
+              <div className="download-actions">
+                <button className="primary" onClick={() => void completeSession()}>
+                  <CheckCircle2 size={14} /> Complete session
+                </button>
+                <small className="muted">Prefix is still mutable — complete it to publish the final file.</small>
+              </div>
+            )}
+
+            {dl.phase !== 'idle' && (
+              <div className={`download-body ${dl.phase}`}>
+                {dl.etag !== '' && (
+                  <div className="download-meta">
+                    <span>size {dl.size}B</span>
+                    <span>
+                      sha256 <code>{dl.sha256.slice(0, 20)}…</code>
+                    </span>
+                    <span>
+                      etag <code>{dl.etag.slice(0, 22)}…</code>
+                    </span>
+                  </div>
+                )}
+
+                <div className="progress" aria-label="Download progress">
+                  <div className="progress-fill" style={{width: `${dlPercent}%`}} />
+                </div>
+                <div className="download-status">
+                  confirmed {dl.confirmed} / {dl.etag === '' ? '?' : dl.size} B locally
+                  {dl.phase === 'done' ? ' · verified ✓' : dl.phase === 'downloading' ? ` · ${dlPercent}%` : ''}
+                </div>
+
+                <div className="download-actions">
+                  {dl.phase === 'info' && (
+                    <button className="primary" onClick={() => void startDownload(dl.sessionId)}>
+                      <Download size={14} /> Download
+                    </button>
+                  )}
+                  {dl.phase === 'downloading' && (
+                    <button onClick={pauseDownload}>
+                      <Pause size={14} /> Pause
+                    </button>
+                  )}
+                  {(dl.phase === 'paused' || (dl.phase === 'failed' && dl.saved)) && (
+                    <button className="primary" onClick={() => void startDownload(dl.sessionId, dl.saved ?? undefined)}>
+                      <Play size={14} /> Resume at {dl.saved?.confirmed ?? 0}B
+                    </button>
+                  )}
+                  {dl.phase === 'failed' && !dl.saved && dl.etag !== '' && (
+                    <button onClick={() => void startDownload(dl.sessionId)}>
+                      <RefreshCw size={14} /> Retry from 0B
+                    </button>
+                  )}
+                  {dl.phase === 'done' && (
+                    <button onClick={saveFile}>
+                      <Save size={14} /> Save file
+                    </button>
+                  )}
+                </div>
+
+                {dl.reason && <p className="download-reason">{dl.reason}</p>}
+
+                {dl.phase === 'done' && dl.finalSha && (
+                  <div className="verdict good">
+                    <CheckCircle2 size={18} />
+                    <div>
+                      <strong>Download verified against pinned identity</strong>
+                      <small>
+                        sha256 {dl.finalSha.slice(0, 24)}…
+                        <br />
+                        {dl.confirmed}B confirmed & hashed locally
+                      </small>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            <p className="muted download-note">
+              Progress lives in browser memory only: a page refresh restarts from 0 bytes — the server
+              offset is never treated as local download progress.
+            </p>
+          </div>
         </aside>
       </section>
     </main>
