@@ -1,4 +1,5 @@
 import {createHash, type Hash, timingSafeEqual} from 'node:crypto';
+import type {Readable} from 'node:stream';
 import type {UploadStorage} from './storage';
 
 export type SessionState = 'active' | 'completed' | 'cancelled';
@@ -57,6 +58,34 @@ export type ConflictBody = {
 
 export type ErrorBody = {error: string; detail?: string};
 export type AppendOutcome = {status: number; body: PatchResultBody | ConflictBody | ErrorBody};
+
+export type FinalizeOutcome =
+  | {status: 200; body: PatchResultBody}
+  | {status: 409; body: {error: 'session_not_active'; state: SessionState}}
+  | {status: 410; body: {error: 'session_expired'}}
+  | {status: 500; body: {error: 'seal_failed'; detail: string}};
+
+/**
+ * A handle on an immutable, downloadable object. `etag`/`sha256` identify the
+ * full byte sequence [0, size); they never change afterwards, so a downloader
+ * can pin them and refuse to splice a different version onto a saved prefix.
+ */
+export type ContentDescriptor = {
+  id: string;
+  name: string;
+  etag: string;
+  size: number;
+  sha256: string;
+};
+
+export type OpenContentOutcome =
+  | {status: 200; descriptor: ContentDescriptor}
+  | {
+      status: 409;
+      body: {error: 'session_not_completed'; state: SessionState; offset: number; sha256: string};
+    }
+  | {status: 410; body: {error: 'session_expired' | 'session_cancelled'}}
+  | {status: 500; body: {error: 'blob_drift'; detail: string}};
 
 export type CreateSessionOptions = {
   id?: string;
@@ -131,22 +160,174 @@ export class UploadEngine {
     void this.storage.remove(session.id).catch(() => undefined);
   }
 
-  cancelSession(id: string): UploadSession | undefined {
-    const session = this.getSession(id);
-    if (!session) return undefined;
-    session.state = 'cancelled';
-    session.expiresAt = null;
-    void this.storage.saveMeta?.(session.id, this.snapshot(session)).catch(() => undefined);
-    return session;
+  /**
+   * Cancel is a state-machine transition, so it runs under the same per-session
+   * lock as appends: it cannot interleave with an in-flight PATCH, and a
+   * completed (frozen) session is never retroactively cancelled — the final
+   * object must remain downloadable even if a late DELETE arrives.
+   */
+  cancelSession(id: string): Promise<FinalizeOutcome> {
+    const session = this.sessions.get(id);
+    if (!session || this.isExpired(session)) {
+      if (session) this.evict(session);
+      return Promise.resolve({status: 410, body: {error: 'session_expired'}});
+    }
+    return this.underLock(session, async () => {
+      if (session.state === 'completed') {
+        return {status: 409, body: {error: 'session_not_active', state: 'completed'}};
+      }
+      if (session.state === 'cancelled') {
+        return {status: 409, body: {error: 'session_not_active', state: 'cancelled'}};
+      }
+      session.state = 'cancelled';
+      session.expiresAt = null;
+      try {
+        await this.storage.saveMeta?.(session.id, this.snapshot(session));
+      } catch {
+        /* in-memory state stands; next snapshot reconciles */
+      }
+      return {status: 200, body: this.resultBody(session)};
+    });
   }
 
-  completeSession(id: string): UploadSession | undefined {
-    const session = this.getSession(id);
-    if (!session || session.state !== 'active') return session;
-    session.state = 'completed';
-    session.expiresAt = null;
-    void this.storage.saveMeta?.(session.id, this.snapshot(session)).catch(() => undefined);
-    return session;
+  /**
+   * Completion FREEZES the session into an immutable object. Before flipping
+   * the state, the durable blob is re-read in full: its length must equal the
+   * committed offset and its SHA-256 must equal the tracked prefix digest.
+   * Only after that seal does the state become 'completed' and reads open.
+   * Serialised by the session lock so it can never race the last append.
+   */
+  completeSession(id: string): Promise<FinalizeOutcome> {
+    const session = this.sessions.get(id);
+    if (!session || this.isExpired(session)) {
+      if (session) this.evict(session);
+      return Promise.resolve({status: 410, body: {error: 'session_expired'}});
+    }
+    return this.underLock(session, async () => {
+      if (this.isExpired(session)) {
+        this.evict(session);
+        return {status: 410, body: {error: 'session_expired'}};
+      }
+      if (session.state === 'completed') {
+        // Idempotent: re-completing confirms the SAME frozen bytes.
+        return {status: 200, body: this.resultBody(session)};
+      }
+      if (session.state === 'cancelled') {
+        return {status: 409, body: {error: 'session_not_active', state: 'cancelled'}};
+      }
+
+      // Seal: prove the durable bytes are exactly the committed prefix.
+      let onDiskLength: number;
+      let onDiskDigest: string;
+      try {
+        onDiskLength = await this.storage.length(session.id);
+        onDiskDigest = await this.storage.digest(session.id);
+      } catch (error) {
+        return {status: 500, body: {error: 'seal_failed', detail: (error as Error).message}};
+      }
+      if (onDiskLength !== session.offset) {
+        return {
+          status: 500,
+          body: {
+            error: 'seal_failed',
+            detail: `blob length ${onDiskLength} != committed offset ${session.offset}`,
+          },
+        };
+      }
+      if (onDiskDigest !== session.sha256) {
+        return {
+          status: 500,
+          body: {error: 'seal_failed', detail: 'blob digest != committed prefix digest'},
+        };
+      }
+
+      session.state = 'completed';
+      session.expiresAt = null;
+      try {
+        await this.storage.saveMeta?.(session.id, this.snapshot(session));
+      } catch {
+        /* bytes are sealed; metadata snapshot is best-effort */
+      }
+      return {status: 200, body: this.resultBody(session)};
+    });
+  }
+
+  /** Run `task` after every prior per-session op, chaining it onto the lock. */
+  private underLock<T>(session: UploadSession, task: () => Promise<T>): Promise<T> {
+    const run = session.lock.then(task);
+    session.lock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * Resolve a session to a downloadable object descriptor. ONLY a completed
+   * session qualifies: an active prefix is still moving, and a cancelled/
+   * expired session must not leak its leftover bytes from disk.
+   *
+   * The stat check here is deliberately O(1): opening (and serving) a tiny
+   * range never hashes or reads the whole blob. The full-file digest was
+   * pinned at completion; the downloader verifies the assembled bytes against
+   * `descriptor.sha256` at the end.
+   */
+  async openContent(id: string): Promise<OpenContentOutcome> {
+    const session = this.sessions.get(id);
+    if (!session || this.isExpired(session)) {
+      if (session) this.evict(session);
+      return {status: 410, body: {error: 'session_expired'}};
+    }
+    if (session.state === 'cancelled') {
+      return {status: 410, body: {error: 'session_cancelled'}};
+    }
+    if (session.state === 'active') {
+      return {
+        status: 409,
+        body: {error: 'session_not_completed', state: 'active', offset: session.offset, sha256: session.sha256},
+      };
+    }
+
+    let onDiskLength: number;
+    try {
+      onDiskLength = await this.storage.length(session.id);
+    } catch (error) {
+      return {status: 500, body: {error: 'blob_drift', detail: (error as Error).message}};
+    }
+    if (onDiskLength !== session.offset) {
+      // The bytes behind the frozen identity changed (e.g. file tampered):
+      // refuse rather than serve a body that disagrees with the ETag.
+      return {
+        status: 500,
+        body: {error: 'blob_drift', detail: `blob length ${onDiskLength} != object size ${session.offset}`},
+      };
+    }
+
+    return {
+      status: 200,
+      descriptor: {
+        id: session.id,
+        name: session.name,
+        etag: session.sha256,
+        size: session.offset,
+        sha256: session.sha256,
+      },
+    };
+  }
+
+  /** Open the bounded byte stream backing an already-resolved descriptor. */
+  openContentStream(id: string, offset: number, endExclusive?: number): Readable {
+    return this.storage.createReadStream(id, offset, endExclusive);
+  }
+
+  private resultBody(session: UploadSession): PatchResultBody {
+    return {
+      id: session.id,
+      offset: session.offset,
+      revision: session.revision,
+      sha256: session.sha256,
+      state: session.state,
+    };
   }
 
   private snapshot(session: UploadSession) {
@@ -204,11 +385,7 @@ export class UploadEngine {
 
     // Chain onto the session lock: concurrent PATCHes on one session are
     // serialised; different sessions stay fully concurrent.
-    const run = session.lock.then(() => this.appendChunkLocked(session, params));
-    session.lock = run.then(
-      () => undefined,
-      () => undefined,
-    );
+    const run = this.underLock(session, () => this.appendChunkLocked(session, params));
 
     if (params.requestId) {
       session.inflight.set(params.requestId, run);

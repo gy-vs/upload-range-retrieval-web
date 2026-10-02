@@ -1,5 +1,7 @@
 import {createHash} from 'node:crypto';
 import {mkdir,open,rename,rm,readFile} from 'node:fs/promises';
+import {createReadStream as fsCreateReadStream} from 'node:fs';
+import {Readable} from 'node:stream';
 import path from 'node:path';
 
 /**
@@ -13,10 +15,16 @@ import path from 'node:path';
  * Metadata (offset, revision, checksum, TTL state) is owned by the engine and
  * snapshotted via `saveMeta`; a metadata snapshot failure also must not lose
  * the just-appended bytes (the next session load reconciles the file length).
+ *
+ * Reads serve a FINALIZED object and MUST be bounded: `createReadStream` and
+ * `readChunk` only ever touch the requested byte window, so serving a small
+ * range never pulls a large file into server memory.
  */
 export interface UploadStorage {
   appendChunk(sessionId: string, offset: number, chunk: Buffer): Promise<void>;
   readChunk(sessionId: string, offset: number, length: number): Promise<Buffer>;
+  /** Bounded byte stream over [offset, endExclusive). endExclusive omitted => to EOF. */
+  createReadStream(sessionId: string, offset: number, endExclusive?: number): Readable;
   length(sessionId: string): Promise<number>;
   digest(sessionId: string): Promise<string>;
   remove(sessionId: string): Promise<void>;
@@ -60,6 +68,14 @@ export class InMemoryStorage implements UploadStorage {
   async readChunk(sessionId: string, offset: number, length: number): Promise<Buffer> {
     const current = this.blobs.get(sessionId) ?? Buffer.alloc(0);
     return current.subarray(offset, offset + length);
+  }
+
+  createReadStream(sessionId: string, offset: number, endExclusive?: number): Readable {
+    // Bounded by construction: only the requested slice is copied into the
+    // stream, regardless of how large the stored blob is.
+    const current = this.blobs.get(sessionId) ?? Buffer.alloc(0);
+    const end = endExclusive === undefined ? current.length : Math.min(endExclusive, current.length);
+    return Readable.from(offset < end ? [current.subarray(offset, end)] : []);
   }
 
   async length(sessionId: string): Promise<number> {
@@ -156,6 +172,14 @@ export class DiskStorage implements UploadStorage {
     } finally {
       await file.close();
     }
+  }
+
+  createReadStream(sessionId: string, offset: number, endExclusive?: number): Readable {
+    // Node honours start/end with bounded positional reads — the whole file is
+    // never buffered in server memory. `end` is inclusive, hence -1.
+    const options: {start: number; end?: number} = {start: offset};
+    if (endExclusive !== undefined) options.end = endExclusive - 1;
+    return fsCreateReadStream(this.fileFor(sessionId), options);
   }
 
   async length(sessionId: string): Promise<number> {
